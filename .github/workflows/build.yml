@@ -1,0 +1,432 @@
+name: Build OpenMW (webOS)
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  pull_request:
+  release:
+    types:
+      - published
+
+env:
+  PACKAGE_NAME: com.cscd98.openmw
+  OPENMW_VERSION: nightly
+
+jobs:
+  build-arm:
+    runs-on: ubuntu-latest
+    env:
+      WITH_FFMPEG: OFF
+
+    steps:
+      - name: Set version from tag
+        if: github.event_name == 'release'
+        run: |
+          echo "OPENMW_VERSION=${GITHUB_REF_NAME}" >> $GITHUB_ENV
+
+      - name: Check Out Repo
+        uses: actions/checkout@v7
+
+      - name: Download ares-cli-rs
+        uses: robinraju/release-downloader@v1
+        with:
+          repository: "webosbrew/ares-cli-rs"
+          latest: true
+          fileName: "ares-package_*_amd64.deb"
+          out-file-path: "temp"
+
+      - name: Download Manifest Generator
+        uses: robinraju/release-downloader@v1
+        with:
+          repository: "webosbrew/dev-toolbox-cli"
+          latest: true
+          fileName: "webosbrew-toolbox-gen-manifest_*.deb"
+          out-file-path: "temp"
+
+      - name: Update packages
+        run: sudo apt-get -yq update
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get -yq install \
+            cmake \
+            git \
+            tar \
+            gcc-multilib \
+            g++-multilib \
+            ./temp/ares-package_*_amd64.deb \
+            ./temp/webosbrew-toolbox-gen-manifest_*.deb
+
+      - name: Download webOS (arm) NDK
+        uses: robinraju/release-downloader@v1
+        with:
+          repository: "openlgtv/buildroot-nc4"
+          latest: true
+          fileName: "arm-webos-linux-gnueabi_sdk-buildroot-x86_64.tar.gz"
+          out-file-path: "/tmp"
+
+      - name: Extract webOS NDK
+        shell: bash
+        working-directory: /tmp
+        run: |
+          tar xzf arm-webos-linux-gnueabi_sdk-buildroot-x86_64.tar.gz
+          ./arm-webos-linux-gnueabi_sdk-buildroot/relocate-sdk.sh
+
+      - name: Download SDL2 (webOS ABI)
+        uses: robinraju/release-downloader@v1
+        with:
+          repository: "webosbrew/SDL-webOS"
+          latest: true
+          fileName: "SDL2-*-webos-abi.tar.gz"
+          out-file-path: "/tmp"
+
+      - name: Extract SDL2
+        shell: bash
+        working-directory: /tmp
+        run: |
+          mkdir -p sdl2-webos
+          tar xzf SDL2-*-webos-abi.tar.gz -C sdl2-webos
+
+      - name: Clone gl4es
+        run: |
+          git clone https://github.com/ptitSeb/gl4es.git
+
+      - name: Build gl4es
+        run: |
+          . /tmp/arm-webos-linux-gnueabi_sdk-buildroot/environment-setup
+          mkdir -p gl4es/build
+          cd gl4es/build
+
+          /usr/bin/cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNOX11=ON
+
+          make -j$(nproc)
+
+      - name: Install gl4es into sysroot
+        run: |
+          . /tmp/arm-webos-linux-gnueabi_sdk-buildroot/environment-setup
+          mkdir -p $STAGING_DIR/usr/include/GL
+          cp -av gl4es/lib/libGL.so* $STAGING_DIR/usr/lib/
+          ln -sf libGL.so.1 $STAGING_DIR/usr/lib/libGL.so
+          cp -av gl4es/include/GL/*.h $STAGING_DIR/usr/include/GL/
+
+      - name: Clone lz4
+        run: |
+          git clone https://github.com/lz4/lz4.git
+
+      - name: Build and install lz4 into staging
+        run: |
+          . /tmp/arm-webos-linux-gnueabi_sdk-buildroot/environment-setup
+          cd lz4
+          make -j$(nproc)
+          make install PREFIX=$STAGING_DIR/usr
+
+      - name: Clone ffmpeg
+        run: |
+          git clone --branch n4.4 https://github.com/FFmpeg/FFmpeg.git ffmpeg
+
+      - name: Configure ffmpeg
+        run: |
+          . /tmp/arm-webos-linux-gnueabi_sdk-buildroot/environment-setup
+          cd ffmpeg
+          ./configure \
+            --prefix=$STAGING_DIR/usr \
+            --cross-prefix=${CROSS_COMPILE} \
+            --arch=arm \
+            --target-os=linux \
+            --enable-cross-compile \
+            --disable-debug \
+            --disable-doc \
+            --disable-programs \
+            --disable-everything \
+            --enable-shared \
+            --enable-avcodec \
+            --enable-avformat \
+            --enable-avutil \
+            --enable-swresample \
+            --enable-swscale \
+            --enable-zlib \
+            --enable-pic
+
+      - name: Build ffmpeg
+        run: |
+          . /tmp/arm-webos-linux-gnueabi_sdk-buildroot/environment-setup
+          cd ffmpeg
+          make -j$(nproc)
+          make install
+
+      - name: Download Boost
+        run: |
+          wget -O boost.tar.gz \
+            https://github.com/boostorg/boost/releases/download/boost-1.83.0/boost-1.83.0.tar.gz
+
+          tar -xzf boost.tar.gz
+          mv boost-1.83.0 boost
+
+      - name: Build boost
+        run: |
+          . /tmp/arm-webos-linux-gnueabi_sdk-buildroot/environment-setup
+
+          cd boost
+
+          ./bootstrap.sh --with-libraries=iostreams,program_options,system,filesystem,regex,atomic
+          cat > user-config.jam <<EOF
+          using gcc : $(${CC} -dumpversion) : ${CXX} :
+              <cxxflags>"${CXXFLAGS}"
+              <linkflags>"${LDFLAGS}" ;
+          EOF
+
+          ./b2 \
+          toolset=gcc \
+          threading=multi \
+          abi=aapcs \
+          variant=release \
+          link=shared \
+          runtime-link=shared \
+          architecture=arm \
+          address-model=32 \
+          --ignore-site-config \
+          --layout=system \
+          --user-config=./user-config.jam \
+          --prefix=$STAGING_DIR/usr \
+          install
+
+      - name: Clone OpenAL Soft
+        run: |
+          git clone https://github.com/kcat/openal-soft.git
+
+      - name: Build OpenAL Soft
+        run: |
+          . /tmp/arm-webos-linux-gnueabi_sdk-buildroot/environment-setup
+
+          mkdir -p openal-soft/build
+          cd openal-soft/build
+
+          /usr/bin/cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=$STAGING_DIR/usr \
+            -DCMAKE_TOOLCHAIN_FILE=$CMAKE_TOOLCHAIN_FILE \
+            -DLIBTYPE=SHARED \
+            -DALSOFT_EXAMPLES=OFF \
+            -DALSOFT_UTILS=OFF \
+            -DALSOFT_TESTS=OFF \
+            -DALSOFT_CONFIG=OFF
+
+          make -j$(nproc)
+          make install
+
+      - name: Clone LuaJIT
+        run: |
+          git clone https://github.com/LuaJIT/LuaJIT.git luajit
+
+      - name: Build LuaJIT
+        run: |
+          . /tmp/arm-webos-linux-gnueabi_sdk-buildroot/environment-setup
+
+          cd luajit
+
+          make -j$(nproc) \
+            HOST_CC="gcc -m32" \
+            CROSS=${CROSS_COMPILE} \
+            TARGET_SYS=Linux \
+            TARGET_FLAGS="${CFLAGS}"
+
+          make install \
+            PREFIX=$STAGING_DIR/usr
+
+      - name: Clone OpenSceneGraph
+        run: |
+          git clone https://github.com/openscenegraph/OpenSceneGraph.git
+          cd OpenSceneGraph
+          git checkout OpenSceneGraph-3.6.5
+          git rev-parse HEAD > ../osg_commit.txt
+
+      - name: Cache OpenSceneGraph build
+        id: cache-osg
+        uses: actions/cache@v4
+        with:
+          path: OpenSceneGraph/build
+          key: osg-build-${{ hashFiles('osg_commit.txt') }}
+
+      - name: Build OpenSceneGraph
+        if: steps.cache-osg.outputs.cache-hit != 'true'
+        run: |
+          . /tmp/arm-webos-linux-gnueabi_sdk-buildroot/environment-setup
+
+          mkdir -p OpenSceneGraph/build
+          cd OpenSceneGraph/build
+
+          /usr/bin/cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=$STAGING_DIR/usr \
+            -DBUILD_OSG_APPLICATIONS=OFF \
+            -DOPENGL_PROFILE="GL2" \
+            -DOSG_WINDOWING_SYSTEM="None" \
+            -DRUN_RESULT_VAR=0 \
+            -DCOMPILE_RESULT_VAR=TRUE \
+            -D_OPENTHREADS_ATOMIC_USE_GCC_BUILTINS_EXITCODE=0
+
+          make -j$(nproc)
+          make install
+
+      - name: Clone OpenMW
+        run: |
+          git clone https://gitlab.com/OpenMW/openmw.git
+          cd openmw
+          git rev-parse HEAD > ../openmw_commit.txt
+
+      - name: Cache OpenMW build
+        id: cache-openmw
+        uses: actions/cache@v4
+        with:
+          path: openmw/build
+          key: openmw-build-${{ hashFiles('openmw_commit.txt') }}
+
+      - name: Build OpenMW
+        if: steps.cache-openmw.outputs.cache-hit != 'true'
+        run: |
+          . /tmp/arm-webos-linux-gnueabi_sdk-buildroot/environment-setup
+          mkdir -p openmw/build
+          cd openmw/build
+
+          /usr/bin/cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_LAUNCHER=OFF \
+            -DBUILD_ESSIMPORTER=OFF \
+            -DBUILD_WIZARD=OFF \
+            -DBUILD_OPENCS=OFF \
+            -DBUILD_BSATOOL=OFF \
+            -DBUILD_ESMTOOL=OFF \
+            -DBUILD_NIFTEST=OFF \
+            -DBUILD_NAVMESHTOOL=OFF \
+            -DBUILD_BULLETOBJECTTOOL=OFF \
+            -DPRECOMPILE_HEADERS_WITH_MSVC=OFF \
+            -DOPENMW_USE_SYSTEM_YAML_CPP=OFF \
+            -DOPENMW_USE_SYSTEM_BULLET=OFF \
+            -DOPENMW_USE_SYSTEM_MYGUI=OFF \
+            -DOPENMW_USE_SYSTEM_RECASTNAVIGATION=OFF \
+            -DMYGUI_RENDERSYSTEM=8 \
+            -DOSG_STATIC=OFF \
+            -DOPENGL_gl_LIBRARY=$STAGING_DIR/usr/lib/libGL.so \
+            -DOPENGL_opengl_LIBRARY=$STAGING_DIR/usr/lib/libGL.so \
+            -DRUN_RESULT_VAR=1 \
+            -DCMAKE_CXX_FLAGS="$CXXFLAGS \
+            -DGL_COMPRESSED_SRGB_S3TC_DXT1_EXT=0x8C4C \
+            -DGL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT=0x8C4D \
+            -DGL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT=0x8C4E \
+            -DGL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT=0x8C4F"
+
+          /usr/bin/cmake --build . --parallel $(nproc)
+
+      - name: Install OpenMW
+        if: steps.cache-openmw.outputs.cache-hit != 'true'
+        run: |
+          . /tmp/arm-webos-linux-gnueabi_sdk-buildroot/environment-setup
+          APPDIR=webos/arm/package/${PACKAGE_NAME}
+          mkdir -p ${APPDIR}
+          mkdir -p ${APPDIR}/lib
+          cd openmw/build
+          DESTDIR="$GITHUB_WORKSPACE/webos/arm/package/${PACKAGE_NAME}" /usr/bin/cmake --install .
+
+      - name: Resolve version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            VERSION="${{ github.event.release.tag_name }}"
+          else
+            VERSION="${OPENMW_VERSION:-nightly}"
+          fi
+
+          echo "OPENMW_VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Package IPK
+        run: |
+          . /tmp/arm-webos-linux-gnueabi_sdk-buildroot/environment-setup
+          APPDIR=webos/arm/package/${PACKAGE_NAME}
+          cp -av /tmp/sdl2-webos/lib/*.so* ${APPDIR}/lib
+
+          cp -av gl4es/lib/libGL.so* ${APPDIR}/lib
+          ln -sf libGL.so.1 ${APPDIR}/lib/libGL.so
+
+          cp -av $STAGING_DIR/usr/lib/liblz4.so* ${APPDIR}/lib
+
+          if [ "${WITH_FFMPEG:-OFF}" = "ON" ]; then
+            cp -av $STAGING_DIR/usr/lib/libavcodec.so* ${APPDIR}/lib
+            cp -av $STAGING_DIR/usr/lib/libavformat.so* ${APPDIR}/lib
+            cp -av $STAGING_DIR/usr/lib/libavutil.so* ${APPDIR}/lib
+            cp -av $STAGING_DIR/usr/lib/libswscale.so* ${APPDIR}/lib
+            cp -av $STAGING_DIR/usr/lib/libswresample.so* ${APPDIR}/lib
+          fi
+
+          cp -av $STAGING_DIR/usr/lib/libboost_*.so* ${APPDIR}/lib
+
+          cp -av $STAGING_DIR/usr/lib/libopenal.so* ${APPDIR}/lib
+
+          cp -av $STAGING_DIR/usr/lib/libluajit-5.1.so* ${APPDIR}/lib/
+
+          cp -av dist/ipk/icon.png ${APPDIR}
+
+          cat > webos/arm/package/${PACKAGE_NAME}/appinfo.json <<EOF
+          {
+            "id": "${PACKAGE_NAME}",
+            "version": "${OPENMW_VERSION}",
+            "type": "native",
+            "title": "OpenMW",
+            "main": "openmw.sh",
+            "icon": "icon.png"
+          }
+          EOF
+
+          mv ${APPDIR}/usr/local/bin/* ${APPDIR}
+          mv ${APPDIR}/usr/local/share ${APPDIR}
+          mv ${APPDIR}/usr/local/etc ${APPDIR}
+
+          ares-package webos/arm/package/${PACKAGE_NAME} -o webos/arm
+
+      - name: Compute IPK filename
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            echo "IPK_NAME=${PACKAGE_NAME}_${OPENMW_VERSION}_${TAG}.ipk" >> $GITHUB_ENV
+          else
+            echo "IPK_NAME=${PACKAGE_NAME}_${OPENMW_VERSION}_all.ipk" >> $GITHUB_ENV
+          fi
+
+      - name: Rename IPK to final name
+        shell: bash
+        run: |
+          mv webos/arm/*.ipk "webos/arm/${IPK_NAME}"
+
+      - name: Generate Manifest
+        shell: bash
+        run: |
+          webosbrew-gen-manifest \
+            -o webos/${PACKAGE_NAME}.manifest.json \
+            -p "webos/arm/${IPK_NAME}" \
+            -i https://github.com/cscd98/openmw-webos/raw/main/dist/ipk/icon.png \
+            -l https://github.com/cscd98/openmw-webos
+
+      - name: Upload default artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.PACKAGE_NAME }}_${{ env.OPENMW_VERSION }}_${{ github.sha }}_arm.ipk
+          path: webos/arm/${{ env.IPK_NAME }}
+          archive: false
+
+      - name: Release
+        if: github.event_name == 'release'
+        uses: ncipollo/release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ github.event.release.tag_name }}
+          allowUpdates: true
+          omitNameDuringUpdate: true
+          omitBody: true
+          omitPrereleaseDuringUpdate: true
+          artifacts: |
+            webos/arm/${{ env.IPK_NAME }}
+            webos/${{ env.PACKAGE_NAME }}.manifest.json
