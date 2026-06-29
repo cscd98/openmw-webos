@@ -1,0 +1,25 @@
+diff --git a/components/platform/platform.cpp b/components/platform/platform.cpp
+index 9743c14337..f7b7ec6d0f 100644
+--- a/components/platform/platform.cpp
++++ b/components/platform/platform.cpp
+@@ -4,6 +4,9 @@
+ #include <stdio.h>
+ #endif
+ 
++#include <cstddef>
++#include <cstdlib>
++
+ namespace Platform
+ {
+ 
+@@ -21,6 +24,9 @@ namespace Platform
+     void init()
+     {
+         increaseFileHandleLimit();
++
++       if (getenv("XDG_RUNTIME_DIR") == NULL)
++               setenv("XDG_RUNTIME_DIR", "/tmp/xdg", 0);
+     }
+ 
+ }
+ 
